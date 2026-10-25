@@ -14,8 +14,8 @@
   *     所以按键改用 EXTII1（PB1），两者互不干扰。
   *
   * 实现的功能：
-  *     1) 按下瞬间：LED 点亮
-  *     2) 松开瞬间：LED 熄灭，并计算"按下持续了多久"
+  *     1) 每按一下（有效按下）：LED 翻转一次（亮↔灭）
+  *     2) 松开瞬间：计算"按下持续了多久"
   *     3) 时长显示在 OLED 上
   *     4) 区分短按（<300ms）与长按（>=300ms）
   *
@@ -53,6 +53,9 @@ static volatile uint16_t lastEdge  = 0;
 
 /** @brief 是否已经记录过有效边沿 */
 static volatile uint8_t  haveEdge  = 0;
+
+/** @brief LED 当前状态（0=灭，1=亮），用来实现"按一下翻转一次" */
+static volatile uint8_t  ledOn     = 0;
 
 /* ============================================================================
  * 二、参数
@@ -154,20 +157,31 @@ void EXTI1_IRQHandler(void)
 
             if (lvl == 0)
             {
-                /* 下降沿：按下 → 记起点，点灯 */
+                /* ===== 下降沿：按下 =====
+                   ① 记下起点，供"松开时算时长"
+                   ② 翻转 LED（按一下翻一次，这正是需求 1） */
                 pressTick = now;
-                GPIO_ResetBits(GPIOA, GPIO_Pin_1);
+
+                if (ledOn)
+                {
+                    ledOn = 0;
+                    GPIO_SetBits(GPIOA, GPIO_Pin_1);      /* 灭（高电平） */
+                }
+                else
+                {
+                    ledOn = 1;
+                    GPIO_ResetBits(GPIOA, GPIO_Pin_1);    /* 亮（低电平） */
+                }
             }
             else
             {
-                /* 上升沿：松开 → 算时长，灭灯 */
+                /* ===== 上升沿：松开 =====
+                   只算时长，不再动 LED（否则就不是"按一下翻一次"了） */
                 uint16_t ticks = (uint16_t)(now - pressTick);
 
                 PressMs = ticks / 10;         /* 100µs/格 → /10 = ms */
                 PressCount++;
                 NewPress = 1;
-
-                GPIO_SetBits(GPIOA, GPIO_Pin_1);
             }
         }
 
