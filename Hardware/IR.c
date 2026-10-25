@@ -215,7 +215,7 @@ void IR_Init(void)
 
     /* ---- ⑤ NVIC：允许 EXTI0 中断，并设成较高优先级 ----
        红外信号是"连续快节奏"的，优先级高一点可以避免被慢任务拖到丢帧。 */
-    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);   /* 全工程只需配置一次 */
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);   /* 全工程只需配置一次 给中断设定度量最优先的中断程序有多优先*/
     NVIC_InitStructure.NVIC_IRQChannel                   = EXTI0_IRQn;
     NVIC_InitStructure.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
