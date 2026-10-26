@@ -1,29 +1,19 @@
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   02-exti：外部中断按键 + 定时器测量按下时长
+  * @brief   03-timer：定时器中断（LED 1Hz + 秒计数）
   *
-  * 硬件连接：
+  * 硬件：
   *     PA1 —— LED（低电平点亮）
-  *     PB1 —— 按键（一端接 PB1，另一端接 GND）   ★ 注意是 PB1，不是 PB0
+  *     OLED —— PB8/PB9
   *
-  * 为什么用 PB1 / EXTI1，而不是 PB0 / EXTI0：
-  *     本工程 Hardware\IR.c 里已经定义了 EXTI0_IRQHandler（红外解码），
-  *     同一个中断向量只能有一个服务函数，否则链接报
-  *     "EXTI0_IRQHandler multiply defined"。
-  *     所以按键改用 EXTII1（PB1），两者互不干扰。
+  * 时间计算：
+  *     72MHz ÷ (PSC+1) = 72MHz ÷ 7200 = 10kHz  → 每格 100µs
+  *     (ARR+1) × 100µs = 5000 × 100µs = 500ms  → 每 500ms 中断一次
   *
-  * 实现的功能：
-  *     1) 每按一下（有效按下）：LED 翻转一次（亮↔灭）
-  *     2) 松开瞬间：计算"按下持续了多久"
-  *     3) 时长显示在 OLED 上
-  *     4) 区分短按（<300ms）与长按（>=300ms）
-  *
-  * 第四个要求的实现思路：
-  *     · TIM3 配成 10kHz 自由计数（每格 100µs），永不清零
-  *     · EXTI1 配成【双边沿】触发：下降沿=按下，上升沿=松开
-  *     · 中断里读 TIM3：按下记起点，松开时相减得到时长
-  *     · 16 位减法天然处理计数器回绕
+  * 现象：
+  *     每 500ms 翻转一次 LED  → 亮 0.5s、灭 0.5s，1 秒一个周期（1Hz）
+  *     每 2 次中断（1 秒）→ n +1，OLED 显示秒数
   ******************************************************************************
   */
 
@@ -31,44 +21,18 @@
 #include "OLED.h"
 
 /* ============================================================================
- * 一、全局变量
+ * 全局变量
+ *
+ * ★ 全部加 volatile：
+ *   它们会被中断修改、主循环读取。不加的话编译器可能把值缓存在寄存器里，
+ *   主循环永远看到 0（即使中断里已经改了）。
  * ==========================================================================*/
-
-/** @brief 最近一次"按下→松开"的时长，单位毫秒（中断写、主循环读） */
-volatile uint16_t PressMs    = 0;
-
-/** @brief 累计完成的按键次数 */
-volatile uint16_t PressCount = 0;
-
-/** @brief 有新的一次按键完成，通知主循环刷新显示 */
-volatile uint8_t  NewPress   = 0;
-
-/* ---- 内部状态（只在中断里使用） ---- */
-
-/** @brief 按下瞬间的定时器计数值 */
-static volatile uint16_t pressTick = 0;
-
-/** @brief 上一次"有效边沿"的计数值，用于消抖 */
-static volatile uint16_t lastEdge  = 0;
-
-/** @brief 按键当前状态（0=松开，1=按下）
-           作用：只有"松开→按下"或"按下→松开"这种状态切换才被接受；
-           抖动产生的同状态重复边沿一律忽略 —— 这是防止"按一次翻好几次"的关键 */
-static volatile uint8_t  keyState  = 0;
-
-/** @brief LED 当前状态（0=灭，1=亮），用来实现"按一下翻转一次" */
-static volatile uint8_t  ledOn     = 0;
+volatile unsigned int n = 0;   /* 秒计数（每 2 次中断 +1） */
+volatile unsigned int a = 0;   /* 500ms 计数，满 2 次算 1 秒 */
+volatile unsigned int b = 1;   /* LED 当前状态：1=亮，0=灭 */
 
 /* ============================================================================
- * 二、参数
- * ==========================================================================*/
-
-/** @brief 消抖门限：两次边沿间隔 < 50ms 视为抖动（10kHz 下 50ms = 500 tick）
-           普通轻触按键抖动可达 20~50ms，20ms 太短，会出现"按一下翻好几次" */
-#define DEBOUNCE_TICKS   500
-
-/* ============================================================================
- * 三、LED：PA1 推挽输出
+ * LED 初始化：PA1 推挽输出
  * ==========================================================================*/
 static void LED_Init(void)
 {
@@ -85,145 +49,100 @@ static void LED_Init(void)
 }
 
 /* ============================================================================
- * 四、按键：PB1 上拉输入 + EXTI1 双边沿中断
+ * TIM4 初始化：每 500ms 产生一次更新中断
  * ==========================================================================*/
-static void Key_Init(void)
+static void TIM4_Init(void)
 {
-    GPIO_InitTypeDef gpio = {0};
-    EXTI_InitTypeDef exti;
-    NVIC_InitTypeDef nvic;
+    TIM_TimeBaseInitTypeDef tb;
+    NVIC_InitTypeDef        nvic;
 
-    /* ① 开时钟：GPIOB（引脚）+ AFIO（EXTI 选路） */
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB | RCC_APB2Periph_AFIO, ENABLE);
+    /* ---------- ① 开时钟 ----------
+       ★ 必须和下面配置的定时器一致：配 TIM4 就开 TIM4。
+       原来写成 TIM3 是致命错误：TIM4 没电，永远不计数。 */
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
 
-    /* ② PB1 上拉输入：松手=高，按下=低（按键另一端接 GND） */
-    gpio.GPIO_Pin  = GPIO_Pin_1;
-    gpio.GPIO_Mode = GPIO_Mode_IPU;
-    GPIO_Init(GPIOB, &gpio);
+    /* ---------- ② 配时基 ----------
+       72MHz ÷ 7200 = 10kHz → 每格 100µs
+       5000 格 × 100µs = 500ms
+       注意 PSC / ARR 都要写"目标值 - 1"（硬件自动加 1） */
+    tb.TIM_Prescaler         = 7200 - 1;   /* 10kHz */
+    tb.TIM_Period            = 5000 - 1;   /* 500ms */
+    tb.TIM_ClockDivision     = TIM_CKD_DIV1;
+    tb.TIM_CounterMode       = TIM_CounterMode_Up;
+    tb.TIM_RepetitionCounter = 0;
+    TIM_TimeBaseInit(TIM4, &tb);
 
-    /* ③ AFIO 选路：EXTI1 ← PB1 */
-    GPIO_EXTILineConfig(GPIO_PortSourceGPIOB, GPIO_PinSource1);
+    /* ---------- ③ 清掉初始化产生的更新事件 ----------
+       TIM_TimeBaseInit 内部会置一次 UG，不清的话一开中断就多进一次。 */
+    TIM_ClearFlag(TIM4, TIM_FLAG_Update);
 
-    /* ④ EXTI1：双边沿触发（按下和松开都要中断） */
-    exti.EXTI_Line    = EXTI_Line1;
-    exti.EXTI_Mode    = EXTI_Mode_Interrupt;
-    exti.EXTI_Trigger = EXTI_Trigger_Rising_Falling;
-    exti.EXTI_LineCmd = ENABLE;
-    EXTI_Init(&exti);
+    /* ---------- ④ 允许"更新中断" ----------
+       对应 DIER 的 UIE 位："数满一圈时允许发中断请求"。 */
+    TIM_ITConfig(TIM4, TIM_IT_Update, ENABLE);
 
-    /* ⑤ NVIC：填 EXTI1_IRQn（中断号 7），不是 EXTI_Line1 */
+    /* ---------- ⑤ 配置 NVIC ---------- */
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
-    nvic.NVIC_IRQChannel                   = EXTI1_IRQn;
+    nvic.NVIC_IRQChannel                   = TIM4_IRQn;   /* 中断号 30 */
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     nvic.NVIC_IRQChannelPreemptionPriority = 2;
     nvic.NVIC_IRQChannelSubPriority        = 0;
     NVIC_Init(&nvic);
+
+    /* ---------- ⑥ 最后启动定时器 ----------
+       放在最后，保证前面的配置都已生效。 */
+    TIM_Cmd(TIM4, ENABLE);
 }
 
 /* ============================================================================
- * 五、TIM3：10kHz 自由计数
- * ==========================================================================*/
-static void TIM3_Init(void)
-{
-    TIM_TimeBaseInitTypeDef tb;
-
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
-
-    /* 72MHz / 7200 = 10kHz → 每格 100µs，16 位满量程约 6.55 秒 */
-    tb.TIM_Prescaler         = 7200 - 1;
-    tb.TIM_Period            = 0xFFFF;
-    tb.TIM_ClockDivision     = TIM_CKD_DIV1;
-    tb.TIM_CounterMode       = TIM_CounterMode_Up;
-    tb.TIM_RepetitionCounter = 0;
-    TIM_TimeBaseInit(TIM3, &tb);
-
-    TIM_SetCounter(TIM3, 0);
-    TIM_Cmd(TIM3, ENABLE);                /* 一直数，不清零 */
-}
-
-/* ============================================================================
- * 六、EXTI1 中断
- * ==========================================================================*/
-void EXTI1_IRQHandler(void)
-{
-    if (EXTI_GetITStatus(EXTI_Line1) != RESET)
-    {
-        uint16_t now = TIM_GetCounter(TIM3);
-        uint8_t  lvl = GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1);
-
-        /* ★ 消抖 + 状态切换双重判断（解决"按一下灯闪好几下"）：
-           ① 距上次"被接受的边沿"必须 ≥ 50ms
-           ② 而且必须是"松开→按下"或"按下→松开"这种状态变化
-              这样抖动产生的重复边沿（状态没变）会被直接忽略，不会反复翻转 */
-        if ((uint16_t)(now - lastEdge) >= DEBOUNCE_TICKS)
-        {
-            if (lvl == 0 && keyState == 0)
-            {
-                /* ===== 松开 → 按下：一次按下只接受一次 ===== */
-                keyState = 1;
-                lastEdge = now;
-                pressTick = now;                  /* 记下起点，供算时长 */
-
-                /* 翻转 LED */
-                if (ledOn)
-                {
-                    ledOn = 0;
-                    GPIO_SetBits(GPIOA, GPIO_Pin_1);      /* 灭（高电平） */
-                }
-                else
-                {
-                    ledOn = 1;
-                    GPIO_ResetBits(GPIOA, GPIO_Pin_1);    /* 亮（低电平） */
-                }
-            }
-            else if (lvl == 1 && keyState == 1)
-            {
-                /* ===== 按下 → 松开：一次松开只接受一次 ===== */
-                keyState = 0;
-                lastEdge = now;
-
-                PressMs = (uint16_t)(now - pressTick) / 10;   /* 100µs/格 → ms */
-                PressCount++;
-                NewPress = 1;
-            }
-            /* 其它情况（状态没变）→ 是抖动，什么都不做 */
-        }
-
-        EXTI_ClearITPendingBit(EXTI_Line1);   /* 必须清 */
-    }
-}
-
-/* ============================================================================
- * 七、主函数
+ * main
  * ==========================================================================*/
 int main(void)
 {
     OLED_Init();
-    OLED_ShowString(1, 1, "Time:");
-    OLED_ShowString(2, 1, "Cnt:");
 
     LED_Init();
-    TIM3_Init();
-    Key_Init();
+    TIM4_Init();          /* 启动 500ms 心跳 */
+
+    OLED_ShowString(1, 1, "N:");
 
     while (1)
     {
-        if (NewPress)
+        /* 主循环只负责显示，不做计时 */
+        OLED_ShowNum(1, 3, n, 5);
+    }
+}
+
+/* ============================================================================
+ * TIM4 中断服务函数：每 500ms 进一次
+ * ==========================================================================*/
+void TIM4_IRQHandler(void)
+{
+    if (TIM_GetITStatus(TIM4, TIM_IT_Update) == SET)
+    {
+        /* ---------- 每 500ms：翻转 LED ---------- */
+        if (b)
         {
-            NewPress = 0;
-
-            OLED_ShowNum(1, 7, PressMs, 5);
-            OLED_ShowNum(2, 6, PressCount, 4);
-
-            if (PressMs < 300)
-            {
-                /* 短按逻辑 */
-            }
-            else
-            {
-                /* 长按逻辑 */
-            }
+            GPIO_ResetBits(GPIOA, GPIO_Pin_1);   /* 亮（低电平） */
+            b = 0;
         }
+        else
+        {
+            GPIO_SetBits(GPIOA, GPIO_Pin_1);     /* 灭（高电平） */
+            b = 1;
+        }
+
+        /* ---------- 数 2 次 500ms = 1 秒，n +1 ----------
+           ★ 原来的 a += a 是错的：a 初始为 0，0+0 永远还是 0，
+             所以永远进不了"n++"那个分支。 */
+        a++;
+        if (a >= 2)
+        {
+            a = 0;
+            n++;
+        }
+
+        /* ★ 必须清标志，否则退出后立刻又进来，主程序卡死 */
+        TIM_ClearITPendingBit(TIM4, TIM_IT_Update);
     }
 }

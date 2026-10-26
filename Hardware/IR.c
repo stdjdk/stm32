@@ -227,7 +227,7 @@ void IR_Init(void)
                  => 每计 1 个数 = 1 / 1MHz = 1µs
        注意：这里 PSC 写 72-1，是因为硬件会自动加 1；
              ARR 写 0xFFFF 表示数到 65535 后自动回到 0 继续数（16 位，不是 8 位）。 */
-    TIM_TimeBaseStructure.TIM_Prescaler     = 72 - 1;   /* 预分频：72MHz -> 1MHz，1 格 = 1µs */
+    TIM_TimeBaseStructure.TIM_Prescaler     = 7200 - 1;   /* 预分频：72MHz -> 1MHz，1 格 = 1µs */
     TIM_TimeBaseStructure.TIM_Period        = 0xFFFF;   /* 自动重装值：16 位满量程 */
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseStructure.TIM_CounterMode   = TIM_CounterMode_Up;
