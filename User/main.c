@@ -51,8 +51,10 @@ static volatile uint16_t pressTick = 0;
 /** @brief 上一次"有效边沿"的计数值，用于消抖 */
 static volatile uint16_t lastEdge  = 0;
 
-/** @brief 是否已经记录过有效边沿 */
-static volatile uint8_t  haveEdge  = 0;
+/** @brief 按键当前状态（0=松开，1=按下）
+           作用：只有"松开→按下"或"按下→松开"这种状态切换才被接受；
+           抖动产生的同状态重复边沿一律忽略 —— 这是防止"按一次翻好几次"的关键 */
+static volatile uint8_t  keyState  = 0;
 
 /** @brief LED 当前状态（0=灭，1=亮），用来实现"按一下翻转一次" */
 static volatile uint8_t  ledOn     = 0;
@@ -61,8 +63,9 @@ static volatile uint8_t  ledOn     = 0;
  * 二、参数
  * ==========================================================================*/
 
-/** @brief 消抖门限：两次边沿间隔 < 20ms 视为抖动（10kHz 下 20ms = 200 tick） */
-#define DEBOUNCE_TICKS   200
+/** @brief 消抖门限：两次边沿间隔 < 50ms 视为抖动（10kHz 下 50ms = 500 tick）
+           普通轻触按键抖动可达 20~50ms，20ms 太短，会出现"按一下翻好几次" */
+#define DEBOUNCE_TICKS   500
 
 /* ============================================================================
  * 三、LED：PA1 推挽输出
@@ -149,19 +152,20 @@ void EXTI1_IRQHandler(void)
         uint16_t now = TIM_GetCounter(TIM3);
         uint8_t  lvl = GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1);
 
-        /* 消抖：距上次有效边沿不足 20ms 的，忽略 */
-        if (!haveEdge || (uint16_t)(now - lastEdge) >= DEBOUNCE_TICKS)
+        /* ★ 消抖 + 状态切换双重判断（解决"按一下灯闪好几下"）：
+           ① 距上次"被接受的边沿"必须 ≥ 50ms
+           ② 而且必须是"松开→按下"或"按下→松开"这种状态变化
+              这样抖动产生的重复边沿（状态没变）会被直接忽略，不会反复翻转 */
+        if ((uint16_t)(now - lastEdge) >= DEBOUNCE_TICKS)
         {
-            haveEdge = 1;
-            lastEdge = now;
-
-            if (lvl == 0)
+            if (lvl == 0 && keyState == 0)
             {
-                /* ===== 下降沿：按下 =====
-                   ① 记下起点，供"松开时算时长"
-                   ② 翻转 LED（按一下翻一次，这正是需求 1） */
-                pressTick = now;
+                /* ===== 松开 → 按下：一次按下只接受一次 ===== */
+                keyState = 1;
+                lastEdge = now;
+                pressTick = now;                  /* 记下起点，供算时长 */
 
+                /* 翻转 LED */
                 if (ledOn)
                 {
                     ledOn = 0;
@@ -173,16 +177,17 @@ void EXTI1_IRQHandler(void)
                     GPIO_ResetBits(GPIOA, GPIO_Pin_1);    /* 亮（低电平） */
                 }
             }
-            else
+            else if (lvl == 1 && keyState == 1)
             {
-                /* ===== 上升沿：松开 =====
-                   只算时长，不再动 LED（否则就不是"按一下翻一次"了） */
-                uint16_t ticks = (uint16_t)(now - pressTick);
+                /* ===== 按下 → 松开：一次松开只接受一次 ===== */
+                keyState = 0;
+                lastEdge = now;
 
-                PressMs = ticks / 10;         /* 100µs/格 → /10 = ms */
+                PressMs = (uint16_t)(now - pressTick) / 10;   /* 100µs/格 → ms */
                 PressCount++;
                 NewPress = 1;
             }
+            /* 其它情况（状态没变）→ 是抖动，什么都不做 */
         }
 
         EXTI_ClearITPendingBit(EXTI_Line1);   /* 必须清 */
