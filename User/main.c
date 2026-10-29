@@ -1,148 +1,114 @@
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   03-timer：定时器中断（LED 1Hz + 秒计数）
+  * @brief   04-pwm：TIM2 通道 2（PA1）输出 1kHz PWM，做呼吸灯
   *
   * 硬件：
   *     PA1 —— LED（低电平点亮）
-  *     OLED —— PB8/PB9
   *
   * 时间计算：
-  *     72MHz ÷ (PSC+1) = 72MHz ÷ 7200 = 10kHz  → 每格 100µs
-  *     (ARR+1) × 100µs = 5000 × 100µs = 500ms  → 每 500ms 中断一次
+  *     72MHz ÷ (PSC+1) = 72MHz ÷ 72 = 1MHz   → 每格 1µs
+  *     (ARR+1) × 1µs = 1000 × 1µs = 1ms      → 1kHz
   *
-  * 现象：
-  *     每 500ms 翻转一次 LED  → 亮 0.5s、灭 0.5s，1 秒一个周期（1Hz）
-  *     每 2 次中断（1 秒）→ n +1，OLED 显示秒数
+  * 占空比：
+  *     CCR = 0    → 0%
+  *     CCR = 1000 → 100%
+  *     占空比 = CCR / 1000
+  *
+  * 注意：
+  *     本板 LED 低电平点亮，所以 CCR 越大（高电平越多）灯越暗。
   ******************************************************************************
   */
 
 #include "stm32f10x.h"
-#include "OLED.h"
+#include "Delay.h"
+
+/* 一个 PWM 周期的计数值 = ARR + 1 */
+#define PWM_PERIOD   3000
 
 /* ============================================================================
- * 全局变量
- *
- * ★ 全部加 volatile：
- *   它们会被中断修改、主循环读取。不加的话编译器可能把值缓存在寄存器里，
- *   主循环永远看到 0（即使中断里已经改了）。
+ * PWM 初始化：TIM2_CH2（PA1），1kHz
  * ==========================================================================*/
-volatile unsigned int n = 0;   /* 秒计数（每 2 次中断 +1） */
-volatile unsigned int a = 0;   /* 500ms 计数，满 2 次算 1 秒 */
-volatile unsigned int b = 1;   /* LED 当前状态：1=亮，0=灭 */
-
-/* ============================================================================
- * LED 初始化：PA1 推挽输出
- * ==========================================================================*/
-static void LED_Init(void)
+static void PWM_Init(void)
 {
-    GPIO_InitTypeDef gpio = {0};
+    GPIO_InitTypeDef        gpio;
+    TIM_TimeBaseInitTypeDef tb;
+    TIM_OCInitTypeDef       oc;
 
+    /* ---------- ① 开时钟 ----------
+       GPIOA 在 APB2，TIM2 在 APB1 */
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
 
+    /* ---------- ② PA1 配成复用推挽 ----------
+       波形由定时器产生，引脚只是"出口"，必须 AF_PP */
     gpio.GPIO_Pin   = GPIO_Pin_1;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Mode  = GPIO_Mode_AF_PP;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &gpio);
 
-    GPIO_SetBits(GPIOA, GPIO_Pin_1);      /* 默认高电平 → LED 灭 */
-}
-
-/* ============================================================================
- * TIM4 初始化：每 500ms 产生一次更新中断
- * ==========================================================================*/
-static void TIM4_Init(void)
-{
-    TIM_TimeBaseInitTypeDef tb;
-    NVIC_InitTypeDef        nvic;
-
-    /* ---------- ① 开时钟 ----------
-       ★ 必须和下面配置的定时器一致：配 TIM4 就开 TIM4。
-       原来写成 TIM3 是致命错误：TIM4 没电，永远不计数。 */
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
-
-    /* ---------- ② 配时基 ----------
-       72MHz ÷ 7200 = 10kHz → 每格 100µs
-       5000 格 × 100µs = 500ms
-       注意 PSC / ARR 都要写"目标值 - 1"（硬件自动加 1） */
-    tb.TIM_Prescaler         = 7200 - 1;   /* 10kHz */
-    tb.TIM_Period            = 5000 - 1;   /* 500ms */
+    /* ---------- ③ 时基：1MHz 计数，1000 个一周期 ---------- */
+    tb.TIM_Prescaler         = 72 - 1;          /* 1MHz，1 格 1µs */
+    tb.TIM_Period            = PWM_PERIOD - 1;  /* 1000 格 = 1ms = 1kHz */
     tb.TIM_ClockDivision     = TIM_CKD_DIV1;
     tb.TIM_CounterMode       = TIM_CounterMode_Up;
     tb.TIM_RepetitionCounter = 0;
-    TIM_TimeBaseInit(TIM4, &tb);
+    TIM_TimeBaseInit(TIM2, &tb);
 
-    /* ---------- ③ 清掉初始化产生的更新事件 ----------
-       TIM_TimeBaseInit 内部会置一次 UG，不清的话一开中断就多进一次。 */
-    TIM_ClearFlag(TIM4, TIM_FLAG_Update);
+    /* ---------- ④ 配置通道 2 为 PWM 模式 ----------
+       ★ 关键是 OC2：对应 CH2 → PA1。
+         如果写成 OC1，改的就是 PA0 的通道，PA1 不会有反应。 */
+    TIM_OCStructInit(&oc);                       /* 先给所有成员默认值 */
+    oc.TIM_OCMode      = TIM_OCMode_PWM1;        /* CNT < CCR 输出有效电平 */
+    oc.TIM_OCPolarity  = TIM_OCPolarity_High;    /* 有效电平 = 高 */
+    oc.TIM_OutputState = TIM_OutputState_Enable;
+    oc.TIM_Pulse       = 0;                      /* 初始 CCR = 0 */
+    TIM_OC2Init(TIM2, &oc);
 
-    /* ---------- ④ 允许"更新中断" ----------
-       对应 DIER 的 UIE 位："数满一圈时允许发中断请求"。 */
-    TIM_ITConfig(TIM4, TIM_IT_Update, ENABLE);
+    /* ---------- ⑤ 预装载：改 CCR 下个周期生效，避免毛刺 ---------- */
+    TIM_OC2PreloadConfig(TIM2, TIM_OCPreload_Enable);
+    TIM_ARRPreloadConfig(TIM2, ENABLE);
 
-    /* ---------- ⑤ 配置 NVIC ---------- */
-    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+    /* ---------- ⑥ 启动 ---------- */
+    TIM_Cmd(TIM2, ENABLE);
+}
 
-    nvic.NVIC_IRQChannel                   = TIM4_IRQn;   /* 中断号 30 */
-    nvic.NVIC_IRQChannelCmd                = ENABLE;
-    nvic.NVIC_IRQChannelPreemptionPriority = 2;
-    nvic.NVIC_IRQChannelSubPriority        = 0;
-    NVIC_Init(&nvic);
-
-    /* ---------- ⑥ 最后启动定时器 ----------
-       放在最后，保证前面的配置都已生效。 */
-    TIM_Cmd(TIM4, ENABLE);
+/**
+  * @brief  设置占空比
+  * @param  duty 0 ~ 1000，对应 0% ~ 100%
+  */
+static void PWM_SetDuty(uint16_t duty)
+{
+    if (duty > PWM_PERIOD)
+    {
+        duty = PWM_PERIOD;          /* 防止越界 */
+    }
+    TIM_SetCompare2(TIM2, duty);    /* ★ 通道 2 对应 PA1 */
 }
 
 /* ============================================================================
- * main
+ * main：呼吸灯
  * ==========================================================================*/
 int main(void)
 {
-    OLED_Init();
+    uint16_t duty;
 
-    LED_Init();
-    TIM4_Init();          /* 启动 500ms 心跳 */
-
-    OLED_ShowString(1, 1, "N:");
+    PWM_Init();
 
     while (1)
     {
-        /* 主循环只负责显示，不做计时 */
-        OLED_ShowNum(1, 3, n, 5);
-    }
-}
-
-/* ============================================================================
- * TIM4 中断服务函数：每 500ms 进一次
- * ==========================================================================*/
-void TIM4_IRQHandler(void)
-{
-    if (TIM_GetITStatus(TIM4, TIM_IT_Update) == SET)
-    {
-        /* ---------- 每 500ms：翻转 LED ---------- */
-        if (b)
+        /* 渐亮：CCR 从 0 加到 1000（低电平变少 → 灯变暗？见下方说明） */
+        for (duty = 0; duty <= PWM_PERIOD; duty += 10)
         {
-            GPIO_ResetBits(GPIOA, GPIO_Pin_1);   /* 亮（低电平） */
-            b = 0;
-        }
-        else
-        {
-            GPIO_SetBits(GPIOA, GPIO_Pin_1);     /* 灭（高电平） */
-            b = 1;
+            PWM_SetDuty(duty);
+            Delay_ms(10);
         }
 
-        /* ---------- 数 2 次 500ms = 1 秒，n +1 ----------
-           ★ 原来的 a += a 是错的：a 初始为 0，0+0 永远还是 0，
-             所以永远进不了"n++"那个分支。 */
-        a++;
-        if (a >= 2)
+        /* 渐暗：CCR 从 1000 减到 0 */
+        for (duty = PWM_PERIOD; duty > 0; duty -= 10)
         {
-            a = 0;
-            n++;
+            PWM_SetDuty(duty);
+            Delay_ms(10);
         }
-
-        /* ★ 必须清标志，否则退出后立刻又进来，主程序卡死 */
-        TIM_ClearITPendingBit(TIM4, TIM_IT_Update);
     }
 }
