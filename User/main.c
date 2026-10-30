@@ -1,28 +1,28 @@
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   05-capture（软件捕获版）：EXTI 双边沿 + TIM4 读时间，测频率/占空比
+  * @brief   05-capture（硬件捕获版）：TIM3 PWM 输入模式测频率/占空比
   *
   * 硬件：
   *     PA1 —— TIM2_CH2 输出 PWM（信号源，1kHz）
-  *     PA6 —— EXTI6 双边沿中断（测量脚）
+  *     PA6 —— TIM3_CH1 输入捕获（测量脚）
   *     PA1 用杜邦线接到 PA6
   *     OLED —— PB8/PB9
   *
-  * 思路（这是"软件捕获"）：
-  *     TIM4 配成 1MHz 自由计数（1 格 = 1µs），只当秒表，不产生中断
-  *     PA6 双边沿触发 EXTI6
-  *     中断里读 TIM4->CNT：
-  *         上升沿 → 与上次上升沿相减 = 周期
-  *         下降沿 → 与本次上升沿相减 = 高电平时间
-  *     频率   = 1,000,000 / 周期
-  *     占空比 = 高电平时间 / 周期
+  * 硬件捕获原理（PWM 输入模式 PWMI）：
+  *     上升沿到达时，定时器硬件做两件事：
+  *         ① 把当前 CNT 存入 CCR1（周期的终点）
+  *         ② 通过从模式 Reset，把 CNT 清零（下一个周期的起点）
+  *     CH2 被 TIM_PWMIConfig 自动配成"下降沿"，把下降沿时刻存入 CCR2
+  *         ↓
+  *     CCR1 = 一个完整周期的计数（1MHz 下 1 计数 = 1µs）
+  *     CCR2 = 高电平的计数
+  *         ↓
+  *     频率   = 1,000,000 / CCR1
+  *     占空比 = CCR2 / CCR1
   *
-  * 注意：
-  *     · 边沿发生后 CPU 要过几微秒才进中断，所以读数"偏晚"
-  *       → 低频没事，高频误差会变大（对比 05 教程里的硬件捕获）
-  *     · PA6 属于 EXTI 线 6，它没有独立向量，
-  *       必须用 EXTI9_5_IRQn（线 5~9 共享一个中断）
+  * 和"软件捕获（EXTI + 读 CNT）"的区别：
+  *     边沿时刻由硬件记录，不受中断延迟影响 → 高频也准
   ******************************************************************************
   */
 
@@ -30,21 +30,15 @@
 #include "OLED.h"
 #include "Delay.h"
 
-#define PWM_PERIOD      1000      /* ARR+1，1kHz */
-#define GLITCH_US       10        /* 小于 10µs 的间隔当毛刺扔掉 */
+#define PWM_PERIOD   1000       /* ARR + 1，1kHz */
 
 /* ---------- 测量结果（中断写，主循环读） ---------- */
 volatile uint32_t g_period_us = 0;   /* 周期（µs） */
-volatile uint32_t g_high_us   = 0;   /* 高电平时间（µs） */
 volatile uint32_t g_freq_hz   = 0;   /* 频率（Hz） */
 volatile uint32_t g_duty      = 0;   /* 占空比（%） */
 
-/* ---------- 中断内部状态 ---------- */
-static volatile uint16_t s_last_rise = 0;   /* 上次上升沿的时刻 */
-static volatile uint8_t  s_have_rise = 0;   /* 是否已经见过上升沿 */
-
 /* ============================================================================
- * 一、PWM 输出：TIM2_CH2（PA1），1kHz
+ * 一、信号源：TIM2_CH2（PA1）输出 1kHz PWM
  * ==========================================================================*/
 static void PWM_Out_Init(void)
 {
@@ -69,16 +63,17 @@ static void PWM_Out_Init(void)
     tb.TIM_RepetitionCounter = 0;
     TIM_TimeBaseInit(TIM2, &tb);
 
-    /* 通道 2 输出 PWM */
     TIM_OCStructInit(&oc);
     oc.TIM_OCMode      = TIM_OCMode_PWM1;
     oc.TIM_OCPolarity  = TIM_OCPolarity_High;
     oc.TIM_OutputState = TIM_OutputState_Enable;
-    oc.TIM_Pulse       = 500;                  /* 初始 50% */
+    oc.TIM_Pulse       = 500;               /* 初始 50% */
     TIM_OC2Init(TIM2, &oc);
 
+    /* 预装载：改 CCR 在周期边界生效，波形不撕裂 */
     TIM_OC2PreloadConfig(TIM2, TIM_OCPreload_Enable);
     TIM_ARRPreloadConfig(TIM2, ENABLE);
+
     TIM_Cmd(TIM2, ENABLE);
 }
 
@@ -90,132 +85,110 @@ static void PWM_SetDuty(uint16_t duty)
 }
 
 /* ============================================================================
- * 二、秒表：TIM4 自由计数，1MHz（不产生任何中断）
+ * 二、测量端：TIM3_CH1（PA6）PWM 输入模式
  * ==========================================================================*/
-static void TimeBase_Init(void)
+static void IC_Init(void)
 {
+    GPIO_InitTypeDef        gpio;
     TIM_TimeBaseInitTypeDef tb;
+    TIM_ICInitTypeDef       ic;
+    NVIC_InitTypeDef        nvic;
 
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
 
-    tb.TIM_Prescaler         = 72 - 1;    /* 1MHz → 1 格 1µs */
-    tb.TIM_Period            = 65535;     /* 16 位满量程，回绕后继续数 */
-    tb.TIM_ClockDivision     = TIM_CKD_DIV1;
-    tb.TIM_CounterMode       = TIM_CounterMode_Up;
-    tb.TIM_RepetitionCounter = 0;
-    TIM_TimeBaseInit(TIM4, &tb);
-
-    TIM_SetCounter(TIM4, 0);
-    TIM_Cmd(TIM4, ENABLE);                /* 一直数，不清零 */
-}
-
-/* ============================================================================
- * 三、EXTI6：PA6 双边沿中断
- * ==========================================================================*/
-static void Exti_Init(void)
-{
-    GPIO_InitTypeDef gpio;
-    EXTI_InitTypeDef exti;
-    NVIC_InitTypeDef nvic;
-
-    /* ① 开 GPIOA + AFIO 时钟（EXTI 选路必须开 AFIO） */
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO, ENABLE);
-
-    /* ② PA6 上拉输入（和 05 一样，空闲保持高电平） */
+    /* ---------- ① PA6 上拉输入 ----------
+       捕获是"读引脚"，所以是输入模式（不是 AF_PP） */
     gpio.GPIO_Pin  = GPIO_Pin_6;
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(GPIOA, &gpio);
 
-    /* ③ AFIO 选路：EXTI6 ← PA6 */
-    GPIO_EXTILineConfig(GPIO_PortSourceGPIOA, GPIO_PinSource6);
+    /* ---------- ② 时基：1MHz，满量程 65535 ----------
+       1 计数 = 1µs；能测的最长周期 65.5ms（最低约 15Hz） */
+    tb.TIM_Prescaler         = 72 - 1;
+    tb.TIM_Period            = 65535;
+    tb.TIM_ClockDivision     = TIM_CKD_DIV1;
+    tb.TIM_CounterMode       = TIM_CounterMode_Up;
+    tb.TIM_RepetitionCounter = 0;
+    TIM_TimeBaseInit(TIM3, &tb);
 
-    /* ④ EXTI6：上升沿和下降沿都触发 */
-    exti.EXTI_Line    = EXTI_Line6;
-    exti.EXTI_Mode    = EXTI_Mode_Interrupt;
-    exti.EXTI_Trigger = EXTI_Trigger_Rising_Falling;
-    exti.EXTI_LineCmd = ENABLE;
-    EXTI_Init(&exti);
+    /* ---------- ③ 配置捕获通道 ----------
+       TIM_PWMIConfig 会自动：
+         CH1 → 上升沿、直连（TI1 → IC1）
+         CH2 → 下降沿、交叉（TI1 → IC2）
+       即"同一个引脚的两个边沿，被两个通道分别记录" */
+    TIM_ICStructInit(&ic);
+    ic.TIM_Channel     = TIM_Channel_1;
+    ic.TIM_ICPolarity  = TIM_ICPolarity_Rising;
+    ic.TIM_ICSelection = TIM_ICSelection_DirectTI;
+    ic.TIM_ICPrescaler = TIM_ICPSC_DIV1;    /* 每个边沿都捕获 */
+    ic.TIM_ICFilter    = 0x0F;              /* 数字滤波，抗毛刺 */
+    TIM_PWMIConfig(TIM3, &ic);
 
-    /* ⑤ NVIC：★ 线 6 没有独立向量，用 EXTI9_5_IRQn（线 5~9 共用） */
+    /* ---------- ④ 从模式：上升沿时清零计数器 ----------
+       ★ 关键：不清零的话，CCR1 只是"某个时刻的计数值"，
+         清零之后 CCR1 才正好等于"一个周期的长度" */
+    TIM_SelectInputTrigger(TIM3, TIM_TS_TI1FP1);     /* 触发源 = CH1 */
+    TIM_SelectSlaveMode(TIM3, TIM_SlaveMode_Reset);  /* 触发时复位 CNT */
+
+    /* ---------- ⑤ 开捕获中断 ---------- */
+    TIM_ITConfig(TIM3, TIM_IT_CC1, ENABLE);
+
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
-    nvic.NVIC_IRQChannel                   = EXTI9_5_IRQn;
+    nvic.NVIC_IRQChannel                   = TIM3_IRQn;
     nvic.NVIC_IRQChannelCmd                = ENABLE;
-    nvic.NVIC_IRQChannelPreemptionPriority = 1;
+    nvic.NVIC_IRQChannelPreemptionPriority = 2;
     nvic.NVIC_IRQChannelSubPriority        = 0;
     NVIC_Init(&nvic);
+
+    TIM_Cmd(TIM3, ENABLE);
 }
 
 /* ============================================================================
- * 四、中断：每次边沿进来，读 TIM4 算时间
+ * 三、捕获中断：每来一个上升沿进一次
  * ==========================================================================*/
-void EXTI9_5_IRQHandler(void)
+void TIM3_IRQHandler(void)
 {
-    /* 线 5~9 共用一个中断，先确认是线 6 触发的 */
-    if (EXTI_GetITStatus(EXTI_Line6) != RESET)
+    if (TIM_GetITStatus(TIM3, TIM_IT_CC1) != RESET)
     {
-        uint16_t now = TIM_GetCounter(TIM4);            /* 当前时刻（µs） */
-        uint8_t  lvl = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6);
+        /* 上升沿时硬件已经把两个值准备好了：
+             CCR1 = 从上次清零到这次上升沿的计数 = 周期
+             CCR2 = 从这次上升沿到下降沿的计数   = 高电平时间 */
+        uint16_t period = TIM_GetCapture1(TIM3);
+        uint16_t high   = TIM_GetCapture2(TIM3);
 
-        if (lvl)
+        if (period != 0)
         {
-            /* ===== 上升沿：算一个完整周期 ===== */
-            if (s_have_rise)
-            {
-                uint16_t period = (uint16_t)(now - s_last_rise);
-
-                /* 太短说明是毛刺，丢弃 */
-                if (period >= GLITCH_US)
-                {
-                    g_period_us = period;
-                    g_freq_hz   = 1000000UL / period;
-                }
-            }
-
-            s_last_rise = now;
-            s_have_rise = 1;
-        }
-        else
-        {
-            /* ===== 下降沿：算高电平时间 ===== */
-            if (s_have_rise)
-            {
-                uint16_t high = (uint16_t)(now - s_last_rise);
-
-                /* 必须比一个周期短，否则是干扰 */
-                if ((g_period_us >= GLITCH_US) && (high <= g_period_us))
-                {
-                    g_high_us = high;
-                    g_duty    = (uint32_t)high * 100UL / g_period_us;
-                }
-            }
+            g_period_us = period;
+            g_freq_hz   = 1000000UL / period;              /* 1µs/格 */
+            g_duty      = (uint32_t)high * 100UL / period;
         }
 
-        EXTI_ClearITPendingBit(EXTI_Line6);
+        TIM_ClearITPendingBit(TIM3, TIM_IT_CC1);
     }
 }
 
 /* ============================================================================
- * 五、main：扫描输出占空比 + 显示测量结果
+ * 四、main：输出占空比扫描 + 显示测量值
  * ==========================================================================*/
 int main(void)
 {
-    uint16_t set_duty = 500;      /* 输出占空比 0~1000 */
+    uint16_t set_duty = 500;      /* 输出占空比（0~1000） */
     int8_t   step     = 25;
 
     OLED_Init();
-    OLED_ShowString(1, 1, "Set:");   /* 我设置的 */
+    OLED_ShowString(1, 1, "Set:");   /* 我设置的占空比 */
     OLED_ShowString(2, 1, "F:");     /* 测到的频率 */
     OLED_ShowString(3, 1, "D:");     /* 测到的占空比 */
     OLED_ShowString(4, 1, "T:");     /* 测到的周期 */
 
     PWM_Out_Init();
-    TimeBase_Init();
-    Exti_Init();
+    IC_Init();
 
     while (1)
     {
-        /* 让输出在 10%~90% 之间来回扫 */
+        /* 让输出占空比在 10%~90% 之间来回变化，便于观察跟踪 */
         if (set_duty >= 900) step = -25;
         if (set_duty <= 100) step =  25;
         set_duty += step;
