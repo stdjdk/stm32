@@ -1,25 +1,28 @@
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   06-encoder（前置验证）：EC11 旋转编码器 + TIM3 编码器模式
+  * @brief   06 前置（下）：TB6612 开环电机测试
   *
-  * 硬件（EC11 模块 5 个脚）：
-  *     EC11 VCC → 3.3V
-  *     EC11 GND → GND
-  *     EC11 C   → GND      ★ 公共端，不接就完全不动
-  *     EC11 A   → PA6      （TIM3_CH1）
-  *     EC11 B   → PA7      （TIM3_CH2）
-  *     OLED     → PB8/PB9
+  * 硬件：
+  *     TB6612 VM   → 5V（手机充电器/充电宝/电池盒，★ 不能用 ST-Link 的 5V）
+  *     TB6612 VCC  → 3.3V
+  *     TB6612 GND  → 公共地（必须和 STM32 GND 连一起）
+  *     TB6612 STBY → PB14（高电平才工作）
+  *     TB6612 PWMA → PA1（TIM2_CH2，20kHz）
+  *     TB6612 AIN1 → PB12
+  *     TB6612 AIN2 → PB13
+  *     TB6612 A01  → 电机红线
+  *     TB6612 A02  → 电机黑线
+  *     OLED        → PB8/PB9
   *
   * 现象：
-  *     顺时针拧一格 → Clk +1，Dir 显示 CW
-  *     逆时针拧一格 → Clk -1，Dir 显示 CCW
-  *     不拧         → 数字不动
+  *     正转：0% → 100% → 保持 1 秒 → 100% → 0%
+  *     停 0.8 秒
+  *     反转：同样一遍
   *
-  * 原理：
-  *     TIM3 配成编码器模式 3（4 倍频）
-  *     硬件根据 A、B 的先后自动给 CNT 加 1 或减 1
-  *     一个"咔哒"档位 = 一个完整周期 = 4 个边沿 = 4 个计数
+  * 注意：
+  *     本 demo 是"开环"——只给 PWM，不知道实际转速
+  *     等带编码器的电机到货，再加上"反馈"，才是闭环
   ******************************************************************************
   */
 
@@ -28,102 +31,179 @@
 #include "Delay.h"
 
 /* ============================================================================
- * 一、编码器初始化：TIM3，PA6/PA7，4 倍频
+ * 一、常量定义
  * ==========================================================================*/
-static void Encoder_Init(void)
+
+/** @brief PWM 周期：72MHz/36 = 2MHz，2MHz/100 = 20kHz（避开人耳） */
+#define MOTOR_PERIOD   100
+
+/* 方向 */
+#define MOTOR_STOP      0
+#define MOTOR_FORWARD   1
+#define MOTOR_BACKWARD  2
+
+/* ============================================================================
+ * 二、电机驱动初始化
+ * ==========================================================================*/
+static void Motor_Init(void)
 {
     GPIO_InitTypeDef        gpio;
     TIM_TimeBaseInitTypeDef tb;
-    TIM_ICInitTypeDef       ic;
+    TIM_OCInitTypeDef       oc;
 
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
 
-    /* ---------- ① PA6、PA7 上拉输入 ----------
-       编码器是"开关"：闭合时接地，断开时悬空
-       必须上拉，否则悬空时电平不定，计数乱跳 */
-    gpio.GPIO_Pin   = GPIO_Pin_6 | GPIO_Pin_7;
-    gpio.GPIO_Mode  = GPIO_Mode_IPU;
+    /* ---------- ① PA1 = PWM 输出（复用推挽） ----------
+       波形由 TIM2_CH2 产生，所以必须 AF_PP */
+    gpio.GPIO_Pin   = GPIO_Pin_1;
+    gpio.GPIO_Mode  = GPIO_Mode_AF_PP;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &gpio);
 
-    /* ---------- ② 时基：不分频，满量程 ----------
-       编码器模式下 PSC 一般设 0：每个边沿都算
-       ARR 设最大：让 CNT 有足够计数范围 */
-    tb.TIM_Prescaler         = 0;
-    tb.TIM_Period            = 65535;
+    /* ---------- ② PB12/PB13 = 方向，PB14 = STBY ----------
+       这三个是普通推挽输出，由 CPU 控制高低 */
+    gpio.GPIO_Pin  = GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_14;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(GPIOB, &gpio);
+
+    /* STBY 拉高：使能芯片（悬空 = 待机，电机不动） */
+    GPIO_SetBits(GPIOB, GPIO_Pin_14);
+
+    /* 初始：方向脚清零（滑行停止） */
+    GPIO_ResetBits(GPIOB, GPIO_Pin_12 | GPIO_Pin_13);
+
+    /* ---------- ③ TIM2：20kHz PWM ---------- */
+    tb.TIM_Prescaler         = 36 - 1;              /* 72MHz → 2MHz */
+    tb.TIM_Period            = MOTOR_PERIOD - 1;    /* 2MHz / 100 = 20kHz */
     tb.TIM_ClockDivision     = TIM_CKD_DIV1;
     tb.TIM_CounterMode       = TIM_CounterMode_Up;
     tb.TIM_RepetitionCounter = 0;
-    TIM_TimeBaseInit(TIM3, &tb);
+    TIM_TimeBaseInit(TIM2, &tb);
 
-    /* ---------- ③ 编码器模式 3：TI1、TI2 边沿都计数（4 倍频） ----------
-       模式 1/2 = 2 倍频（只数一路）
-       模式 3   = 4 倍频（两路四个边沿都数），分辨率最高 */
-    TIM_EncoderInterfaceConfig(TIM3,
-                               TIM_EncoderMode_TI12,
-                               TIM_ICPolarity_Rising,
-                               TIM_ICPolarity_Rising);
-    /* ---------- ④ 输入滤波 ----------
-       EC11 是机械触点，转动时有 1~5ms 抖动
-       不滤波会"拧一格跳好几下"
-       0x0F 是最强滤波 */
-    TIM_ICStructInit(&ic);
-    ic.TIM_Channel     = TIM_Channel_1;
-    ic.TIM_ICPolarity  = TIM_ICPolarity_Rising;
-    ic.TIM_ICSelection = TIM_ICSelection_DirectTI;
-    ic.TIM_ICPrescaler = TIM_ICPSC_DIV1;
-    ic.TIM_ICFilter    = 0x0F;
-    TIM_ICInit(TIM3, &ic);
+    TIM_OCStructInit(&oc);
+    oc.TIM_OCMode      = TIM_OCMode_PWM1;
+    oc.TIM_OCPolarity  = TIM_OCPolarity_High;
+    oc.TIM_OutputState = TIM_OutputState_Enable;
+    oc.TIM_Pulse       = 0;                         /* 初始不转 */
+    TIM_OC2Init(TIM2, &oc);
 
-    ic.TIM_Channel = TIM_Channel_2;
-    TIM_ICInit(TIM3, &ic);
-
-    /* ---------- ⑤ 启动 ---------- */
-    TIM_SetCounter(TIM3, 0);
-    TIM_Cmd(TIM3, ENABLE);
+    TIM_OC2PreloadConfig(TIM2, TIM_OCPreload_Enable);
+    TIM_ARRPreloadConfig(TIM2, ENABLE);
+    TIM_Cmd(TIM2, ENABLE);
 }
 
 /* ============================================================================
- * 二、main
+ * 三、电机控制函数
+ * ==========================================================================*/
+
+/**
+  * @brief  设置速度
+  * @param  duty 0~100（100 = 全速）
+  */
+static void Motor_SetSpeed(uint16_t duty)
+{
+    if (duty > MOTOR_PERIOD)
+    {
+        duty = MOTOR_PERIOD;
+    }
+    TIM_SetCompare2(TIM2, duty);      /* 通道 2 对应 PA1 */
+}
+
+/**
+  * @brief  设置方向
+  * @param  dir MOTOR_FORWARD / MOTOR_BACKWARD / MOTOR_STOP
+  */
+static void Motor_SetDir(uint8_t dir)
+{
+    if (dir == MOTOR_FORWARD)
+    {
+        GPIO_SetBits(GPIOB, GPIO_Pin_12);      /* AIN1 = 1 */
+        GPIO_ResetBits(GPIOB, GPIO_Pin_13);    /* AIN2 = 0 */
+    }
+    else if (dir == MOTOR_BACKWARD)
+    {
+        GPIO_ResetBits(GPIOB, GPIO_Pin_12);    /* AIN1 = 0 */
+        GPIO_SetBits(GPIOB, GPIO_Pin_13);      /* AIN2 = 1 */
+    }
+    else
+    {
+        /* 两个都为 0：滑行停止 */
+        GPIO_ResetBits(GPIOB, GPIO_Pin_12 | GPIO_Pin_13);
+    }
+}
+
+/** @brief 停止 */
+static void Motor_Stop(void)
+{
+    Motor_SetSpeed(0);
+    Motor_SetDir(MOTOR_STOP);
+}
+
+/* ============================================================================
+ * 四、main：正转升速 → 保持 → 降速 → 停 → 反转
  * ==========================================================================*/
 int main(void)
 {
-    uint16_t last  = 0;      /* 上次读到的 CNT */
-    int32_t  total = 0;      /* 累计计数（正=正转，负=反转） */
-    int16_t  delta;          /* 本次增量（带方向） */
-    uint32_t abs_total;
+    uint16_t s;
 
     OLED_Init();
-    OLED_ShowString(1, 1, "Cnt:");   /* 累计计数（4 倍频） */
-    OLED_ShowString(2, 1, "Dir:");   /* 方向 */
-    OLED_ShowString(3, 1, "Clk:");   /* 档位数 */
-    OLED_ShowString(4, 1, "EC11");
+    OLED_ShowString(1, 1, "Spd:");
+    OLED_ShowString(2, 1, "Dir:");
+    OLED_ShowString(3, 1, "TB6612");
+    OLED_ShowString(4, 1, "open-loop");
 
-    Encoder_Init();
+    Motor_Init();
+    Motor_Stop();
 
     while (1)
     {
-        uint16_t now;
+        /* ========== 正转：0% → 100% ========== */
+        Motor_SetDir(MOTOR_FORWARD);
+        OLED_ShowString(2, 5, "FWD");
 
-        Delay_ms(20);                        /* 20ms 采样一次 */
+        for (s = 0; s <= MOTOR_PERIOD; s += 5)
+        {
+            Motor_SetSpeed(s);
+            OLED_ShowNum(1, 5, s, 3);
+            Delay_ms(150);
+        }
 
-        now   = TIM_GetCounter(TIM3);
-        delta = (int16_t)(now - last);       /* 带方向的增量 */
-        last  = now;
+        Delay_ms(1000);                         /* 全速保持 1 秒 */
 
-        total += delta;                      /* 累加 */
+        /* ========== 正转：100% → 0% ========== */
+        for (s = MOTOR_PERIOD; s > 0; s -= 5)
+        {
+            Motor_SetSpeed(s);
+            OLED_ShowNum(1, 5, s, 3);
+            Delay_ms(150);
+        }
 
-        abs_total = (uint32_t)(total < 0 ? -total : total);
+        Motor_Stop();
+        Delay_ms(800);                          /* 停 0.8 秒 */
 
-        /* ---------- 显示 ---------- */
-        OLED_ShowNum(1, 5, abs_total, 5);
+        /* ========== 反转：0% → 100% ========== */
+        Motor_SetDir(MOTOR_BACKWARD);
+        OLED_ShowString(2, 5, "REV");
 
-        if (delta > 0)      OLED_ShowString(2, 5, "CW ");
-        else if (delta < 0) OLED_ShowString(2, 5, "CCW");
-        else                OLED_ShowString(2, 5, "---");
+        for (s = 0; s <= MOTOR_PERIOD; s += 5)
+        {
+            Motor_SetSpeed(s);
+            OLED_ShowNum(1, 5, s, 3);
+            Delay_ms(150);
+        }
 
-        /* 一个"咔哒"档位 = 4 个计数（4 倍频） */
-        OLED_ShowNum(3, 5, abs_total / 4, 5);
+        Delay_ms(1000);
+
+        /* ========== 反转：100% → 0% ========== */
+        for (s = MOTOR_PERIOD; s > 0; s -= 5)
+        {
+            Motor_SetSpeed(s);
+            OLED_ShowNum(1, 5, s, 3);
+            Delay_ms(150);
+        }
+
+        Motor_Stop();
+        Delay_ms(800);
     }
 }
