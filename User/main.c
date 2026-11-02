@@ -1,28 +1,21 @@
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   06 前置（下）：TB6612 开环电机测试
+  * @brief   07-adc：ADC1 通道 0（PA0）单次转换，OLED 显示原始值和电压
   *
   * 硬件：
-  *     TB6612 VM   → 5V（手机充电器/充电宝/电池盒，★ 不能用 ST-Link 的 5V）
-  *     TB6612 VCC  → 3.3V
-  *     TB6612 GND  → 公共地（必须和 STM32 GND 连一起）
-  *     TB6612 STBY → PB14（高电平才工作）
-  *     TB6612 PWMA → PA1（TIM2_CH2，20kHz）
-  *     TB6612 AIN1 → PB12
-  *     TB6612 AIN2 → PB13
-  *     TB6612 A01  → 电机红线
-  *     TB6612 A02  → 电机黑线
-  *     OLED        → PB8/PB9
+  *     光敏电阻模块 VCC → 3.3V
+  *     光敏电阻模块 GND → GND
+  *     光敏电阻模块 AO  → PA0（ADC1_IN0）   ★ 是 AO，不是 DO
+  *     OLED              → PB8/PB9
+  *
+  * 换算：
+  *     12 位 ADC → 0~4095
+  *     电压(mV) = 原始值 × 3300 / 4095
   *
   * 现象：
-  *     正转：0% → 100% → 保持 1 秒 → 100% → 0%
-  *     停 0.8 秒
-  *     反转：同样一遍
-  *
-  * 注意：
-  *     本 demo 是"开环"——只给 PWM，不知道实际转速
-  *     等带编码器的电机到货，再加上"反馈"，才是闭环
+  *     遮住 / 放开光敏电阻，Raw、mV、V 都会变化
+  *     （变化方向取决于模块，可能越暗越大，也可能越小）
   ******************************************************************************
   */
 
@@ -31,179 +24,104 @@
 #include "Delay.h"
 
 /* ============================================================================
- * 一、常量定义
+ * 一、ADC 初始化：ADC1 通道 0（PA0）
  * ==========================================================================*/
-
-/** @brief PWM 周期：72MHz/36 = 2MHz，2MHz/100 = 20kHz（避开人耳） */
-#define MOTOR_PERIOD   100
-
-/* 方向 */
-#define MOTOR_STOP      0
-#define MOTOR_FORWARD   1
-#define MOTOR_BACKWARD  2
-
-/* ============================================================================
- * 二、电机驱动初始化
- * ==========================================================================*/
-static void Motor_Init(void)
+static void ADC_Init_PA0(void)
 {
-    GPIO_InitTypeDef        gpio;
-    TIM_TimeBaseInitTypeDef tb;
-    TIM_OCInitTypeDef       oc;
+    GPIO_InitTypeDef gpio;
+    ADC_InitTypeDef  adc;
 
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
+    /* ---------- ① 开时钟 ----------
+       ADC1 挂 APB2，GPIOA 也挂 APB2 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_ADC1, ENABLE);
 
-    /* ---------- ① PA1 = PWM 输出（复用推挽） ----------
-       波形由 TIM2_CH2 产生，所以必须 AF_PP */
-    gpio.GPIO_Pin   = GPIO_Pin_1;
-    gpio.GPIO_Mode  = GPIO_Mode_AF_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    /* ---------- ② ADC 时钟分频：不能超过 14MHz ----------
+       72MHz / 6 = 12MHz ✅
+       如果选 Div2（36MHz），ADC 超频，读数不准 */
+    RCC_ADCCLKConfig(RCC_PCLK2_Div6);
+
+    /* ---------- ③ PA0 配成模拟输入 ----------
+       必须 AIN：断开数字输入电路，避免上拉/下拉干扰模拟信号 */
+    gpio.GPIO_Pin  = GPIO_Pin_0;
+    gpio.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_Init(GPIOA, &gpio);
 
-    /* ---------- ② PB12/PB13 = 方向，PB14 = STBY ----------
-       这三个是普通推挽输出，由 CPU 控制高低 */
-    gpio.GPIO_Pin  = GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_14;
-    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    GPIO_Init(GPIOB, &gpio);
+    /* ---------- ④ ADC 基本参数：独立 + 单次 + 单通道 + 软件触发 + 右对齐 ---------- */
+    adc.ADC_Mode               = ADC_Mode_Independent;      /* 只用 ADC1 */
+    adc.ADC_ScanConvMode       = DISABLE;                   /* 不扫描（单通道） */
+    adc.ADC_ContinuousConvMode = DISABLE;                   /* 单次转换 */
+    adc.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_None; /* 软件触发 */
+    adc.ADC_DataAlign          = ADC_DataAlign_Right;       /* 右对齐：读出来就是 0~4095 */
+    adc.ADC_NbrOfChannel       = 1;                         /* 规则组 1 个通道 */
+    ADC_Init(ADC1, &adc);
 
-    /* STBY 拉高：使能芯片（悬空 = 待机，电机不动） */
-    GPIO_SetBits(GPIOB, GPIO_Pin_14);
+    /* ---------- ⑤ 规则通道：通道 0、第 1 个、采样 55.5 周期 ----------
+       光敏电阻内阻较大，采样时间给长一点，让采样电容充满 */
+    ADC_RegularChannelConfig(ADC1,
+                             ADC_Channel_0,
+                             1,
+                             ADC_SampleTime_55Cycles5);
 
-    /* 初始：方向脚清零（滑行停止） */
-    GPIO_ResetBits(GPIOB, GPIO_Pin_12 | GPIO_Pin_13);
+    /* ---------- ⑥ 使能 ADC1 ---------- */
+    ADC_Cmd(ADC1, ENABLE);
 
-    /* ---------- ③ TIM2：20kHz PWM ---------- */
-    tb.TIM_Prescaler         = 36 - 1;              /* 72MHz → 2MHz */
-    tb.TIM_Period            = MOTOR_PERIOD - 1;    /* 2MHz / 100 = 20kHz */
-    tb.TIM_ClockDivision     = TIM_CKD_DIV1;
-    tb.TIM_CounterMode       = TIM_CounterMode_Up;
-    tb.TIM_RepetitionCounter = 0;
-    TIM_TimeBaseInit(TIM2, &tb);
+    /* ---------- ⑦ 校准（必须） ----------
+       复位校准 → 等完成 → 开始校准 → 等完成 */
+    ADC_ResetCalibration(ADC1);
+    while (ADC_GetResetCalibrationStatus(ADC1) == SET);
 
-    TIM_OCStructInit(&oc);
-    oc.TIM_OCMode      = TIM_OCMode_PWM1;
-    oc.TIM_OCPolarity  = TIM_OCPolarity_High;
-    oc.TIM_OutputState = TIM_OutputState_Enable;
-    oc.TIM_Pulse       = 0;                         /* 初始不转 */
-    TIM_OC2Init(TIM2, &oc);
-
-    TIM_OC2PreloadConfig(TIM2, TIM_OCPreload_Enable);
-    TIM_ARRPreloadConfig(TIM2, ENABLE);
-    TIM_Cmd(TIM2, ENABLE);
-}
-
-/* ============================================================================
- * 三、电机控制函数
- * ==========================================================================*/
-
-/**
-  * @brief  设置速度
-  * @param  duty 0~100（100 = 全速）
-  */
-static void Motor_SetSpeed(uint16_t duty)
-{
-    if (duty > MOTOR_PERIOD)
-    {
-        duty = MOTOR_PERIOD;
-    }
-    TIM_SetCompare2(TIM2, duty);      /* 通道 2 对应 PA1 */
+    ADC_StartCalibration(ADC1);
+    while (ADC_GetCalibrationStatus(ADC1) == SET);
 }
 
 /**
-  * @brief  设置方向
-  * @param  dir MOTOR_FORWARD / MOTOR_BACKWARD / MOTOR_STOP
+  * @brief  读一次 ADC
+  * @return 0~4095
   */
-static void Motor_SetDir(uint8_t dir)
+static uint16_t ADC_Read(void)
 {
-    if (dir == MOTOR_FORWARD)
-    {
-        GPIO_SetBits(GPIOB, GPIO_Pin_12);      /* AIN1 = 1 */
-        GPIO_ResetBits(GPIOB, GPIO_Pin_13);    /* AIN2 = 0 */
-    }
-    else if (dir == MOTOR_BACKWARD)
-    {
-        GPIO_ResetBits(GPIOB, GPIO_Pin_12);    /* AIN1 = 0 */
-        GPIO_SetBits(GPIOB, GPIO_Pin_13);      /* AIN2 = 1 */
-    }
-    else
-    {
-        /* 两个都为 0：滑行停止 */
-        GPIO_ResetBits(GPIOB, GPIO_Pin_12 | GPIO_Pin_13);
-    }
-}
+    /* ① 软件启动一次转换 */
+    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
 
-/** @brief 停止 */
-static void Motor_Stop(void)
-{
-    Motor_SetSpeed(0);
-    Motor_SetDir(MOTOR_STOP);
+    /* ② 等转换结束（EOC = End Of Conversion） */
+    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET);
+
+    /* ③ 读数据（读 DR 会自动清 EOC） */
+    return ADC_GetConversionValue(ADC1);
 }
 
 /* ============================================================================
- * 四、main：正转升速 → 保持 → 降速 → 停 → 反转
+ * 二、main
  * ==========================================================================*/
 int main(void)
 {
-    uint16_t s;
+    uint16_t raw;       /* 0~4095 */
+    uint32_t mv;        /* 毫伏 0~3300 */
 
     OLED_Init();
-    OLED_ShowString(1, 1, "Spd:");
-    OLED_ShowString(2, 1, "Dir:");
-    OLED_ShowString(3, 1, "TB6612");
-    OLED_ShowString(4, 1, "open-loop");
+    OLED_ShowString(1, 1, "Raw:");
+    OLED_ShowString(2, 1, "mV:");
+    OLED_ShowString(3, 1, "V:");
+    OLED_ShowString(4, 1, "PA0 Light");
 
-    Motor_Init();
-    Motor_Stop();
+    ADC_Init_PA0();
 
     while (1)
     {
-        /* ========== 正转：0% → 100% ========== */
-        Motor_SetDir(MOTOR_FORWARD);
-        OLED_ShowString(2, 5, "FWD");
+        raw = ADC_Read();                       /* 读原始值 0~4095 */
+        mv  = (uint32_t)raw * 3300 / 4095;      /* 换算成毫伏 */
 
-        for (s = 0; s <= MOTOR_PERIOD; s += 5)
-        {
-            Motor_SetSpeed(s);
-            OLED_ShowNum(1, 5, s, 3);
-            Delay_ms(150);
-        }
+        /* 第 1 行：原始值（4 位） */
+        OLED_ShowNum(1, 6, raw, 4);
 
-        Delay_ms(1000);                         /* 全速保持 1 秒 */
+        /* 第 2 行：毫伏（4 位） */
+        OLED_ShowNum(2, 5, mv, 4);
 
-        /* ========== 正转：100% → 0% ========== */
-        for (s = MOTOR_PERIOD; s > 0; s -= 5)
-        {
-            Motor_SetSpeed(s);
-            OLED_ShowNum(1, 5, s, 3);
-            Delay_ms(150);
-        }
+        /* 第 3 行：电压，保留两位小数，例如 2.15 */
+        OLED_ShowNum(3, 4, mv / 1000, 1);
+        OLED_ShowString(3, 5, ".");
+        OLED_ShowNum(3, 6, (mv % 1000) / 10, 2);
 
-        Motor_Stop();
-        Delay_ms(800);                          /* 停 0.8 秒 */
-
-        /* ========== 反转：0% → 100% ========== */
-        Motor_SetDir(MOTOR_BACKWARD);
-        OLED_ShowString(2, 5, "REV");
-
-        for (s = 0; s <= MOTOR_PERIOD; s += 5)
-        {
-            Motor_SetSpeed(s);
-            OLED_ShowNum(1, 5, s, 3);
-            Delay_ms(150);
-        }
-
-        Delay_ms(1000);
-
-        /* ========== 反转：100% → 0% ========== */
-        for (s = MOTOR_PERIOD; s > 0; s -= 5)
-        {
-            Motor_SetSpeed(s);
-            OLED_ShowNum(1, 5, s, 3);
-            Delay_ms(150);
-        }
-
-        Motor_Stop();
-        Delay_ms(800);
+        Delay_ms(100);                          /* 100ms 刷新一次 */
     }
 }
