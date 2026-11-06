@@ -32,16 +32,19 @@
  * 一、参数（★ 标定后要改这里）
  * ==========================================================================*/
 
-/** @brief 1 = 标定模式（手转），0 = 测速模式（电机转） */
-#define CALIB_MODE        1
+/** @brief 模式：0=测速  1=手转标定  2=全速反推标定  3=调试（看 LOOP/CNT） */
+#define CALIB_MODE        0
 
 /**
   * @brief 输出轴转一圈的编码器计数
-  * @note  标定方法：CALIB_MODE=1，手转 10 圈，读数 ÷ 10
-  *        理论值 = 线数(11) × 4 × 减速比
-  *        333RPM 版本若减速比 1:20 → 11×4×20 = 880
+  * @note  本电机参数：11 线、4 倍频、减速比 1:30
+  *        11 × 4 × 30 = 1320
+  *        其他校验方法：
+  *          手转法：CALIB_MODE=1，手转 10 圈，读数 ÷ 10
+  *          全速反推：CALIB_MODE=2，12V 满 PWM 跑稳后读 Delta，
+  *                    COUNTS_PER_REV = Delta × 600 / 333
   */
-#define COUNTS_PER_REV    880
+#define COUNTS_PER_REV    1320
 
 /** @brief PWM 周期：72MHz/36 = 2MHz，2MHz/100 = 20kHz */
 #define MOTOR_PERIOD      100
@@ -190,20 +193,33 @@ static int16_t Encoder_GetDelta(void)
 int main(void)
 {
     int16_t  delta;
+
+#if CALIB_MODE != 3
     int32_t  total = 0;
+#endif
 
 #if !CALIB_MODE
     int32_t  rpm;
-    uint16_t pwm   = 30;      /* 测速模式下的占空比 0~100 */
+    uint16_t pwm   = 100;     /* 测速模式下的占空比 0~100（3.7V 先用 100） */
 #endif
 
     OLED_Init();
 
-#if CALIB_MODE
-    OLED_ShowString(1, 1, "CALIB");
+#if CALIB_MODE == 1
+    OLED_ShowString(1, 1, "CALIB1");
     OLED_ShowString(2, 1, "Cnt:");
     OLED_ShowString(3, 1, "Rev:");
     OLED_ShowString(4, 1, "turn 10x");
+#elif CALIB_MODE == 2
+    OLED_ShowString(1, 1, "CALIB2");
+    OLED_ShowString(2, 1, "D:");
+    OLED_ShowString(3, 1, "T:");
+    OLED_ShowString(4, 1, "fullspeed");
+#elif CALIB_MODE == 3
+    OLED_ShowString(1, 1, "LOOP:");
+    OLED_ShowString(2, 1, "CNT:");
+    OLED_ShowString(3, 1, "D:");
+    OLED_ShowString(4, 1, "DBG");
 #else
     OLED_ShowString(1, 1, "RPM:");
     OLED_ShowString(2, 1, "Dir:");
@@ -216,8 +232,8 @@ int main(void)
     Motor_SetSpeed(0);
     Motor_SetDir(MOTOR_STOP);
 
-#if CALIB_MODE
-    /* ---------- 标定模式：手转，累计计数 ---------- */
+#if CALIB_MODE == 1
+    /* ---------- 手转标定：手转 10 圈，读累计计数 ---------- */
     while (1)
     {
         Delay_ms(SAMPLE_MS);
@@ -227,8 +243,47 @@ int main(void)
         OLED_ShowNum(2, 5, (uint32_t)(total < 0 ? -total : total), 6);
         OLED_ShowNum(3, 5, (uint32_t)((total < 0 ? -total : total) / 4), 5);
     }
+#elif CALIB_MODE == 2
+    /* ---------- 全速反推标定 ----------
+       12V 满 PWM 跑稳后，读 100ms 的 Delta：
+           COUNTS_PER_REV = Delta × 600 / 333
+       注意：必须 12V 供电，5V 时转速不是 333，不能这样算 */
+    Motor_SetDir(MOTOR_FORWARD);
+    Motor_SetSpeed(100);
+
+    while (1)
+    {
+        Delay_ms(SAMPLE_MS);
+        delta = Encoder_GetDelta();
+        total += delta;
+
+        OLED_ShowNum(2, 5, (uint32_t)(delta < 0 ? -delta : delta), 4);
+        OLED_ShowNum(3, 5, (uint32_t)(total < 0 ? -total : total), 6);
+    }
+#elif CALIB_MODE == 3
+    /* ---------- 调试模式 ----------
+       看三件事：
+         LOOP：循环次数，涨 = 程序在跑，不涨 = 复位/卡死
+         CNT ：TIM3 原始计数，电机转时应该变化
+         D   ：100ms 增量 */
+    {
+        uint32_t loop_cnt = 0;
+
+        Motor_SetDir(MOTOR_FORWARD);
+        Motor_SetSpeed(100);
+
+        while (1)
+        {
+            Delay_ms(SAMPLE_MS);
+            delta = Encoder_GetDelta();
+            loop_cnt++;
+
+            OLED_ShowNum(1, 6, loop_cnt, 5);
+            OLED_ShowNum(2, 5, TIM_GetCounter(TIM3), 5);
+            OLED_ShowNum(3, 3, (uint32_t)(delta < 0 ? -delta : delta), 4);
+        }
+    }
 #else
-    /* ---------- 测速模式：驱动电机，显示 RPM ---------- */
     Motor_SetDir(MOTOR_FORWARD);
     Motor_SetSpeed(pwm);
 
