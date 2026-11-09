@@ -1,157 +1,192 @@
-/**
-  ******************************************************************************
-  * @file    main.c
-  * @brief   09-uart：USART1 收发（printf 重定向 + 回显）
-  *
-  * 硬件：
-  *     PA9  (TX) → CH340 的 RXD
-  *     PA10 (RX) ← CH340 的 TXD
-  *     GND       — CH340 的 GND   （不要接 VCC）
-  *     PA1  → LED（低电平点亮）
-  *
-  * 现象：
-  *     ① 每 500ms 发一行 "Hello from STM32! tick=N"
-  *     ② 电脑发什么字符，板子原样发回（回显）
-  *     ③ LED 每 500ms 翻转
-  *
-  * 必须：
-  *     Keil → Options for Target → Target → ☑ Use MicroLIB
-  *     （否则 printf 走半主机，脱离调试器就卡死）
-  ******************************************************************************
-  */
+/*
+adc-tmi定时采样->dma搬运数据->usart串口与电脑通讯
+do--pin0
+rx--pin10
+tx--pin9
+*/
+
+
+
 
 #include "stm32f10x.h"
+#include "OLED.h"
 #include "Delay.h"
 #include <stdio.h>
 
-/* ============================================================================
- * 一、USART1 初始化
- * ==========================================================================*/
-static void USART1_Init(uint32_t baud)
+
+volatile uint16_t adc_buf[1] = {0};
+
+static void dma_init_adc(void) 
+{
+   DMA_InitTypeDef dma;
+   
+	RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1,ENABLE);
+   DMA_DeInit(DMA1_Channel1);//开启通道
+
+	dma.DMA_PeripheralBaseAddr=(uint32_t)&ADC1->DR;//数据地址
+    dma.DMA_MemoryBaseAddr= (uint32_t)adc_buf;//数据去除地址
+    dma.DMA_DIR=DMA_DIR_PeripheralSRC;//数据流向adc->stm32外设到内存
+    dma.DMA_BufferSize=1;//搬几个
+    
+	dma.DMA_PeripheralInc=DMA_PeripheralInc_Disable;//地址指向是否增减
+	dma.DMA_MemoryInc=DMA_MemoryInc_Disable;
+	
+	dma.DMA_MemoryDataSize= DMA_MemoryDataSize_HalfWord;//数据大小16位二进制
+	dma.DMA_PeripheralDataSize= DMA_PeripheralDataSize_HalfWord;
+	
+	dma.DMA_Mode=DMA_Mode_Circular;//循环搬运模式
+	dma.DMA_Priority=DMA_Priority_Medium;
+	dma.DMA_M2M=DMA_M2M_Disable;//非内存
+	 DMA_Init(DMA1_Channel1, &dma);
+
+    DMA_Cmd(DMA1_Channel1, ENABLE);//打开dma->dac1通道
+	
+}
+
+
+static void adc_init(void)
+{
+    GPIO_InitTypeDef gpio;
+    ADC_InitTypeDef  adc;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_ADC1, ENABLE);
+    RCC_ADCCLKConfig(RCC_PCLK2_Div6);          
+
+    gpio.GPIO_Pin  = GPIO_Pin_0;
+    gpio.GPIO_Mode = GPIO_Mode_AIN;
+    GPIO_Init(GPIOA, &gpio);
+
+    adc.ADC_Mode               = ADC_Mode_Independent;
+    adc.ADC_ScanConvMode       = DISABLE;                        /* 多通道 */
+    adc.ADC_ContinuousConvMode = DISABLE;                       /* 单次，靠触发 */
+    adc.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_T3_TRGO;  /* TIM3 触发 */
+    adc.ADC_DataAlign          = ADC_DataAlign_Right;
+    adc.ADC_NbrOfChannel       = 1;                             /* 两个通道 */
+    ADC_Init(ADC1, &adc);
+	
+	 ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1, ADC_SampleTime_55Cycles5);//设定优先级
+	
+     ADC_Cmd(ADC1, ENABLE);//使能
+
+    ADC_ResetCalibration(ADC1);//校准
+    while (ADC_GetResetCalibrationStatus(ADC1) == SET);
+    ADC_StartCalibration(ADC1);
+    while (ADC_GetCalibrationStatus(ADC1) == SET);
+
+    ADC_DMACmd(ADC1, ENABLE);//开启adc-dma
+    ADC_ExternalTrigConvCmd(ADC1, ENABLE);//开启adc-tmi
+}
+	static void tmi_init(void)
+	{
+	
+	TIM_TimeBaseInitTypeDef tb;
+
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+
+    
+    tb.TIM_Prescaler         = 72 - 1;
+    tb.TIM_Period            = 1000 - 1;
+    tb.TIM_ClockDivision     = TIM_CKD_DIV1;
+    tb.TIM_CounterMode       = TIM_CounterMode_Up;
+    tb.TIM_RepetitionCounter = 0;
+	
+	  TIM_TimeBaseInit(TIM3, &tb);
+
+    TIM_SelectOutputTrigger(TIM3, TIM_TRGOSource_Update);//开启溢出事件输出到trgo-adc
+
+    TIM_Cmd(TIM3, ENABLE);
+	
+	}
+
+	static void led_init(void)
+	{
+	
+	GPIO_InitTypeDef  gpio;
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+		
+		
+    gpio.GPIO_Pin   = GPIO_Pin_7;
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &gpio);
+
+    GPIO_SetBits(GPIOA, GPIO_Pin_7);     
+	
+	}
+	
+	static void USART1_Init(uint32_t baud)
 {
     GPIO_InitTypeDef  gpio;
     USART_InitTypeDef usart;
 
-    /* ---------- ① 开时钟：USART1 和 GPIOA 都在 APB2 ---------- */
+    
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1 | RCC_APB2Periph_GPIOA, ENABLE);
 
-    /* ---------- ② PA9 = TX，复用推挽 ----------
-       波形由 USART 外设产生，所以必须 AF_PP */
+   
     gpio.GPIO_Pin   = GPIO_Pin_9;
     gpio.GPIO_Mode  = GPIO_Mode_AF_PP;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &gpio);
 
-    /* ---------- ③ PA10 = RX，上拉输入 ----------
-       上拉：没接信号时保持高电平（空闲态） */
+  
     gpio.GPIO_Pin  = GPIO_Pin_10;
     gpio.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_Init(GPIOA, &gpio);
 
-    /* ---------- ④ USART 参数：8N1，收发都开 ---------- */
-    usart.USART_BaudRate            = baud;                      /* 115200 */
-    usart.USART_WordLength          = USART_WordLength_8b;       /* 8 数据位 */
-    usart.USART_StopBits            = USART_StopBits_1;          /* 1 停止位 */
-    usart.USART_Parity              = USART_Parity_No;           /* 无校验 */
+   
+    usart.USART_BaudRate            = baud;
+    usart.USART_WordLength          = USART_WordLength_8b;
+    usart.USART_StopBits            = USART_StopBits_1;
+    usart.USART_Parity              = USART_Parity_No;
     usart.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
     usart.USART_Mode                = USART_Mode_Tx | USART_Mode_Rx;
     USART_Init(USART1, &usart);
 
-    /* ---------- ⑤ 使能 ---------- */
+  
     USART_Cmd(USART1, ENABLE);
 }
 
-/* ============================================================================
- * 二、printf 重定向
- * ==========================================================================*/
 
-/**
-  * @brief  把 printf 的字符输出重定向到 USART1
-  * @note   printf 内部逐个字符调用 fputc；
-  *         我们重写它，让字符走串口。
-  *         需要 Keil 勾选 Use MicroLIB。
-  */
 int fputc(int ch, FILE *f)
 {
-    /* 等发送寄存器空，再写数据（否则覆盖未发完的字节） */
     while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
     USART_SendData(USART1, (uint8_t)ch);
     return ch;
 }
-
-/* ============================================================================
- * 三、收发小工具
- * ==========================================================================*/
-
-/** @brief 发一个字节 */
-static void USART_SendByte(uint8_t ch)
+	
+	int main(void)
 {
-    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
-    USART_SendData(USART1, ch);
-}
+	unsigned int led=0;
+	uint16_t l;
+	uint8_t ch;
+	 
+	OLED_Init();
+	USART1_Init(115200);
+	led_init();
+	dma_init_adc(); 
+	adc_init();
+	tmi_init();
+	
+	while(1)
+	{
+	l=adc_buf[0];
 
-/**
-  * @brief  轮询接收：有数据就原样发回（回显）
-  * @note   读 DR 会自动清 RXNE
-  */
-static void USART_Poll_Echo(void)
-{
-    if (USART_GetFlagStatus(USART1, USART_FLAG_RXNE) != RESET)
+	
+	printf("L=%u\r\n",l);
+
+	 if (led) { GPIO_SetBits(GPIOA, GPIO_Pin_1);   led = 0; }
+     else{ GPIO_ResetBits(GPIOA, GPIO_Pin_1); led = 1; }
+	
+	 	 	
+	if (USART_GetFlagStatus(USART1, USART_FLAG_RXNE) != RESET)
     {
-        uint8_t ch = (uint8_t)USART_ReceiveData(USART1);
-        USART_SendByte(ch);          /* 原样发回 */
+     ch = (uint8_t)USART_ReceiveData(USART1);  
     }
+	 
+	 OLED_ShowChar(1, 1,ch);
+
+	/* ② 限速：每 200ms 发一次（5Hz），否则会把串口刷爆 */
+	Delay_ms(200);
+	}
 }
 
-/* ============================================================================
- * 四、LED
- * ==========================================================================*/
-static void LED_Init(void)
-{
-    GPIO_InitTypeDef gpio = {0};
-
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
-
-    gpio.GPIO_Pin   = GPIO_Pin_1;
-    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOA, &gpio);
-
-    GPIO_SetBits(GPIOA, GPIO_Pin_1);     /* 默认灭 */
-}
-
-/* ============================================================================
- * 五、main
- * ==========================================================================*/
-int main(void)
-{
-    uint32_t tick = 0;
-    uint8_t  led  = 0;
-    uint8_t  i;
-
-    LED_Init();
-    USART1_Init(115200);                 /* ★ 和电脑端波特率一致 */
-
-    printf("\r\nSTM32 UART ready, baud=115200\r\n");
-    printf("Type something, it will echo back.\r\n");
-    printf("--------------------------------\r\n");
-
-    while (1)
-    {
-        /* ---- 发一行数据 ---- */
-        printf("Hello from STM32! tick=%lu\r\n", tick);
-        tick++;
-
-        /* ---- LED 翻转 ---- */
-        if (led) { GPIO_SetBits(GPIOA, GPIO_Pin_1);   led = 0; }
-        else     { GPIO_ResetBits(GPIOA, GPIO_Pin_1); led = 1; }
-
-        /* ---- 等 500ms，同时每 10ms 检查一次接收 ----
-           这样电脑发来的字符能较快回显，不用中断 */
-        for (i = 0; i < 50; i++)
-        {
-            USART_Poll_Echo();
-            Delay_ms(10);
-        }
-    }
-}
