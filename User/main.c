@@ -1,142 +1,168 @@
-/**
+﻿/**
   ******************************************************************************
   * @file    main.c
-  * @brief   12-rtc：RTC 走时 + OLED 显示（逐行注释）
+  * @brief   13-wdg：IWDG 独立看门狗演示（逐行注释）
   *
-  * 硬件：不需要外接模块
-  *     · 板子有 32.768kHz 晶振 → 用 LSE，走时准
-  *     · 没有 → 自动退到 LSI（内部 RC，会漂）
-  *     · 想要掉电保持 → VBAT 接纽扣电池
+  * 硬件：
+  *     LED   → PA1（低电平点亮）
+  *     按键  → PB1（按下接地，上拉输入）
+  *     串口  → PA9(TX) / PA10(RX)，115200
   *
   * 现象：
-  *     RTC:
-  *     D: 0            ← 从起点过了多少天
-  *     T: 00:00:05     ← 时:分:秒，每秒 +1
+  *     ① 正常：每秒打印一行动作 + LED 翻转
+  *     ② 按下 PB1：程序进入死循环（不再喂狗）
+  *     ③ 约 4 秒后：芯片自动复位，串口打印"看门狗复位"
+  *
+  * 注意：
+  *     Keil 勾选 Use MicroLIB（printf 重定向需要）
   ******************************************************************************
   */
 
-#include "stm32f10x.h"   /* 标准外设库：RCC/RTC/BKP/PWR 的函数和寄存器定义都在里面 */
-#include "OLED.h"        /* OLED 显示 */
-#include "Delay.h"       /* Delay_ms：控制刷新节奏 */
+#include "stm32f10x.h"   /* 标准外设库：RCC/IWDG/GPIO/USART 都在这里 */
+#include "OLED.h"        /* OLED（本 demo 可不用，保留方便扩展） */
+#include "Delay.h"       /* Delay_ms */
+#include <stdio.h>       /* printf */
 
 /* ============================================================================
- * 一、宏定义
+ * 一、串口初始化（用来观察复位现象）
  * ==========================================================================*/
-
-/* 备份寄存器里的"魔法值"：用来判断这次上电前，RTC 是否已经初始化过。
-   任意一个约定好的数都行，只要和"未初始化"时的值（通常 0x0000）不同即可 */
-#define RTC_MAGIC   0xA5A5
-
-/* ============================================================================
- * 二、RTC 初始化
- * ==========================================================================*/
-static void RTC_Init_Config(void)
+static void USART1_Init(uint32_t baud)
 {
-    /* ---------- ① 开 PWR 和 BKP 的时钟 ----------
-       PWR：电源控制，用来解锁备份域
-       BKP：备份寄存器，用来存"已初始化"标记
-       两个都挂在 APB1 上 */
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_PWR | RCC_APB1Periph_BKP, ENABLE);
+    GPIO_InitTypeDef  gpio;   /* GPIO 参数结构体 */
+    USART_InitTypeDef usart;  /* USART 参数结构体 */
 
-    /* ---------- ② 解锁备份域 ----------
-       备份域默认"写保护"，不解锁的话写 RTC/BKP 全部无效（而且不报错） */
-    PWR_BackupAccessCmd(ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1 | RCC_APB2Periph_GPIOA, ENABLE);  /* USART1 和 GPIOA 都在 APB2 */
 
-    /* ---------- ③ 判断是不是第一次上电 ----------
-       读 BKP_DR1：等于魔法值 = 以前初始化过，时间还在走，不能重置
-       不等于 = 第一次（或电池没电丢了），需要完整初始化 */
-    if (BKP_ReadBackupRegister(BKP_DR1) != RTC_MAGIC)
-    {
-        uint32_t timeout;   /* 等 LSE 起振的超时计数，防止没晶振时死等 */
+    gpio.GPIO_Pin   = GPIO_Pin_9;               /* PA9 = TX */
+    gpio.GPIO_Mode  = GPIO_Mode_AF_PP;          /* 复用推挽：波形由 USART 产生 */
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &gpio);
 
-        /* ---------- ④ 先尝试 LSE（外部 32.768kHz 晶振，精度最高） ---------- */
-        RCC_LSEConfig(RCC_LSE_ON);      /* 让 LSE 振荡器开始工作 */
+    gpio.GPIO_Pin  = GPIO_Pin_10;               /* PA10 = RX */
+    gpio.GPIO_Mode = GPIO_Mode_IPU;             /* 上拉输入 */
+    GPIO_Init(GPIOA, &gpio);
 
-        timeout = 0xFFFFF;              /* 给一个足够大的超时值 */
-        while (RCC_GetFlagStatus(RCC_FLAG_LSERDY) == RESET)
-        {
-            /* LSERDY=0 表示还没稳定；一直等，直到超时 */
-            if (--timeout == 0) break;  /* 减到 0 说明等了太久 → 大概率没焊晶振 */
-        }
+    usart.USART_BaudRate            = baud;                        /* 115200 */
+    usart.USART_WordLength          = USART_WordLength_8b;         /* 8 位 */
+    usart.USART_StopBits            = USART_StopBits_1;            /* 1 停止位 */
+    usart.USART_Parity              = USART_Parity_No;             /* 无校验 */
+    usart.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    usart.USART_Mode                = USART_Mode_Tx | USART_Mode_Rx;
+    USART_Init(USART1, &usart);
+    USART_Cmd(USART1, ENABLE);
+}
 
-        if (timeout == 0)
-        {
-            /* ---------- ⑤ LSE 起不来 → 退到 LSI（内部 40kHz RC） ---------- */
-            RCC_LSICmd(ENABLE);                                 /* 启动内部 LSI */
-            while (RCC_GetFlagStatus(RCC_FLAG_LSIRDY) == RESET); /* 等 LSI 稳定（内部振荡器很快） */
-
-            RCC_RTCCLKConfig(RCC_RTCCLKSource_LSI);             /* 选 LSI 当 RTC 时钟 */
-            RCC_RTCCLKCmd(ENABLE);                              /* 把 RTC 时钟送到 RTC 模块 */
-            RTC_WaitForSynchro();                               /* 等 RTC 寄存器跨时钟域同步 */
-            RTC_WaitForLastTask();                              /* 等上一次写操作落盘 */
-
-            RTC_SetPrescaler(40000 - 1);                        /* LSI≈40kHz，40000 分频 → 1Hz，即每秒 +1 */
-            RTC_WaitForLastTask();                              /* 等预分频写进去 */
-        }
-        else
-        {
-            /* ---------- ⑥ LSE 正常 ---------- */
-            RCC_RTCCLKConfig(RCC_RTCCLKSource_LSE);             /* 选 LSE 当 RTC 时钟 */
-            RCC_RTCCLKCmd(ENABLE);                              /* 使能 RTC 时钟 */
-            RTC_WaitForSynchro();                               /* 同步 */
-            RTC_WaitForLastTask();                              /* 等上次写完成 */
-
-            RTC_SetPrescaler(32768 - 1);                        /* 32768Hz / 32768 = 1Hz */
-            RTC_WaitForLastTask();                              /* 等预分频生效 */
-        }
-
-        /* ---------- ⑦ 设初始时间 ----------
-           这里从 0 开始；想要真实时间就填 Unix 时间戳（电脑上算好） */
-        RTC_SetCounter(0);
-        RTC_WaitForLastTask();          /* 等计数器写进去 */
-
-        /* ---------- ⑧ 打标记 ----------
-           写进 BKP_DR1，下次上电读到它就跳过初始化，时间继续走 */
-        BKP_WriteBackupRegister(BKP_DR1, RTC_MAGIC);
-    }
-    else
-    {
-        /* ---------- 已经初始化过：只同步，绝对不能重置计数器 ---------- */
-        RTC_WaitForSynchro();           /* 让 CPU 看到 RTC 的最新值 */
-        RTC_WaitForLastTask();          /* 等上次操作完成 */
-    }
+/** @brief printf 重定向到串口（需要 Use MicroLIB） */
+int fputc(int ch, FILE *f)
+{
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);  /* 等发送区空 */
+    USART_SendData(USART1, (uint8_t)ch);                           /* 写 DR 发出去 */
+    return ch;
 }
 
 /* ============================================================================
- * 三、main
+ * 二、LED 与按键
+ * ==========================================================================*/
+static void LED_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};                 /* 全部清零，避免未初始化字段 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+
+    gpio.GPIO_Pin   = GPIO_Pin_1;                /* PA1 */
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;          /* 推挽输出 */
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &gpio);
+
+    GPIO_SetBits(GPIOA, GPIO_Pin_1);             /* 默认灭（低电平亮） */
+}
+
+static void KEY_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    gpio.GPIO_Pin  = GPIO_Pin_1;                 /* PB1 */
+    gpio.GPIO_Mode = GPIO_Mode_IPU;              /* 上拉输入：没按时为高 */
+    GPIO_Init(GPIOB, &gpio);
+}
+
+/* ============================================================================
+ * 三、IWDG 初始化（4 秒超时）
+ * ==========================================================================*/
+static void IWDG_Init_4s(void)
+{
+    /* ① 打开 LSI（约 40kHz）：IWDG 用它当独立时钟，主时钟挂了它还在跑 */
+    RCC_LSICmd(ENABLE);
+
+    /* ② 等 LSI 稳定：不稳定就配置，分频会错 */
+    while (RCC_GetFlagStatus(RCC_FLAG_LSIRDY) == RESET);
+
+    /* ③ 解锁 IWDG 的写保护：不解锁，后面三句全部无效 */
+    IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
+
+    /* ④ 预分频 64：LSI 40kHz / 64 = 625Hz，即每 1.6ms 减 1 */
+    IWDG_SetPrescaler(IWDG_Prescaler_64);
+
+    /* ⑤ 重装值 625：625 × 1.6ms ≈ 1 秒？不——见下行注释
+          实际公式 T = (4 × 2^PR) × RLR / 40000
+          PR=64 → 4×64 = 256 → 256 × 625 / 40000 = 4.0 秒 */
+    IWDG_SetReload(625);
+
+    /* ⑥ 先喂一次，把计数器装满 */
+    IWDG_ReloadCounter();
+
+    /* ⑦ 启动：此后无法关闭，只能靠复位 */
+    IWDG_Enable();
+}
+
+/* ============================================================================
+ * 四、main
  * ==========================================================================*/
 int main(void)
 {
-    uint32_t total;        /* RTC 总秒数 */
-    uint32_t days;         /* 从起点过了多少天 */
-    uint32_t sec_of_day;   /* 当天是第几秒（0~86399） */
-    uint8_t  hh, mm, ss;   /* 时、分、秒 */
+    uint32_t tick = 0;   /* 心跳计数，也用来控制 LED */
 
-    OLED_Init();                    /* 初始化 OLED（PB8/PB9 软件 I2C） */
-    OLED_ShowString(1, 1, "RTC:");  /* 第 1 行标题 */
-    OLED_ShowString(2, 1, "D:");    /* 第 2 行：天数 */
-    OLED_ShowString(3, 1, "T:");    /* 第 3 行：时:分:秒 */
+    LED_Init();                       /* 初始化 LED */
+    KEY_Init();                       /* 初始化按键 */
+    USART1_Init(115200);              /* 初始化串口，方便观察 */
 
-    RTC_Init_Config();              /* 初始化 RTC（首次才真正配置，之后跳过） */
+    /* ---------- 第 1 步：判断这次复位是什么原因 ----------
+       看门狗复位会置位 IWDG 标志；必须清掉，否则以后每次读都为真 */
+    if (RCC_GetFlagStatus(RCC_FLAG_IWDGRST) != RESET)
+    {
+        printf("\r\n[RESET] IWDG reset\r\n");     /* 说明是程序卡死被救回来了 */
+        RCC_ClearFlag();                           /* 清所有复位标志 */
+    }
+    else
+    {
+        printf("\r\n[RESET] power-on / NRST\r\n");   /* 正常上电 / 按了复位键 */
+    }
 
+    printf("IWDG demo start (timeout 4s)\r\n");
+    printf("Press PB1 to simulate hang\r\n");
+
+    /* ---------- 第 2 步：启动看门狗 ---------- */
+    IWDG_Init_4s();
+
+    /* ---------- 第 3 步：主循环 ---------- */
     while (1)
     {
-        total = RTC_GetCounter();          /* 读 32 位秒计数器，这就是"现在几秒" */
+        IWDG_ReloadCounter();          /* 喂狗：必须在 4 秒内至少喂一次 */
 
-        days       = total / 86400;        /* 86400 秒 = 1 天 → 换算成天数 */
-        sec_of_day = total % 86400;        /* 余数 = 当天已经过的秒数 */
+        printf("heartbeat %lu\r\n", tick);   /* 打印心跳，证明程序活着 */
+        tick++;
 
-        hh = sec_of_day / 3600;            /* 3600 秒 = 1 小时 */
-        mm = (sec_of_day % 3600) / 60;     /* 剩下的再除以 60 = 分钟 */
-        ss = sec_of_day % 60;              /* 余数就是秒 */
+        /* LED 翻转：亮灭交替，肉眼看程序是否在跑 */
+        if (tick & 1) GPIO_ResetBits(GPIOA, GPIO_Pin_1);   /* 奇数拍：亮 */
+        else          GPIO_SetBits(GPIOA, GPIO_Pin_1);     /* 偶数拍：灭 */
 
-        OLED_ShowNum(2, 3, days, 3);       /* 第 2 行第 3 列显示天数（3 位） */
-        OLED_ShowNum(3, 3, hh, 2);         /* 显示时（2 位） */
-        OLED_ShowString(3, 5, ":");        /* 冒号分隔 */
-        OLED_ShowNum(3, 6, mm, 2);         /* 显示分 */
-        OLED_ShowString(3, 8, ":");        /* 冒号分隔 */
-        OLED_ShowNum(3, 9, ss, 2);         /* 显示秒 */
+        /* 按下 PB1 → 故意进入死循环，模拟"程序跑飞" */
+        if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_1) == RESET)
+        {
+            printf("HANG! stop feeding dog...\r\n");
+            while (1);                 /* 死循环里不再喂狗 → 4 秒后 IWDG 复位 */
+        }
 
-        Delay_ms(200);                     /* 200ms 刷一次：既看着连续，又不闪 */
+        Delay_ms(500);                 /* 每 500ms 一次，喂狗间隔远小于 4s */
     }
 }
